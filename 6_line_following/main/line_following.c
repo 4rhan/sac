@@ -9,28 +9,32 @@
 #define WHITE_MARGIN 0
 #define bound_LSA_LOW 0
 #define bound_LSA_HIGH 1000
-#define BLACK_BOUNDARY 830 // Boundary value to distinguish between black and white readings
-#define IR_SENSOR_PIN GPIO_NUM_19
+#define BLACK_BOUNDARY 830        // Boundary value to distinguish between black and white readings
+#define IR_SENSOR_PIN GPIO_NUM_19 // IR sensor pin
 
 const int weights[5] = {-5, -3, 1, 3, 5};
 
 // Motor value bounds
-int optimum_duty_cycle = 57;
-int lower_duty_cycle = 45;
-int higher_duty_cycle = 65;
+int optimum_duty_cycle = 60;
+int lower_duty_cycle = 46;
+int higher_duty_cycle = 66;
 float left_duty_cycle = 0, right_duty_cycle = 0;
 int left_turn_flag = 0;
 int right_turn_flag = 0;
 int u_turn_flag = 0;
 int all_black_flag = 1;
 // Line Following PID Variables
-float error = 0, prev_error = 0, difference, cumulative_error, correction;
+float error = 0, prev_error = 0, difference = 0, cumulative_error = 0, correction;
 #define NOR 15
 
 int objectflag = 1;
 
 #define REQUIRED_WHITE_COUNT 50
 int cwhitecount = 0;
+
+// IR sensor debouncing
+#define IR_DEBOUNCE_COUNT 5
+int ir_obstacle_count = 0;
 // Sensor history tracking for sensors 0 and 4
 int sensor_0_history[NOR] = {0};
 int sensor_4_history[NOR] = {0};
@@ -137,7 +141,7 @@ void line_follow_task(void *arg)
     ESP_ERROR_CHECK(enable_line_sensor(&line_sensor));
     ESP_ERROR_CHECK(enable_bar_graph());
 
-    // ir
+    // Configure IR sensor
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << IR_SENSOR_PIN),
         .mode = GPIO_MODE_INPUT,
@@ -145,7 +149,7 @@ void line_follow_task(void *arg)
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_DISABLE};
     gpio_config(&io_conf);
-//
+
 #ifdef CONFIG_ENABLE_OLED
     ESP_ERROR_CHECK(init_oled());
     vTaskDelay(100);
@@ -154,18 +158,8 @@ void line_follow_task(void *arg)
 
     while (true)
     {
-
+        // Read IR sensor state (0 = obstacle detected, 1 = no obstacle)
         int ir_state = gpio_get_level(IR_SENSOR_PIN);
-        if (ir_state == 0)
-        {
-            ESP_LOGI("debug", "Obstacle detected!");
-            // Handle obstacle detection logic here
-            // You could stop or change the behavior when the obstacle is detected
-        }
-        else
-        {
-            ESP_LOGI("debug", "No obstacle detected.");
-        }
 
         line_sensor_readings = read_line_sensor(line_sensor);
 
@@ -175,7 +169,7 @@ void line_follow_task(void *arg)
             line_sensor_readings.adc_reading[i] = map(line_sensor_readings.adc_reading[i], WHITE_MARGIN, BLACK_MARGIN, bound_LSA_LOW, bound_LSA_HIGH);
             line_sensor_readings.adc_reading[i] = 1000 - line_sensor_readings.adc_reading[i];
         }
-        // END
+
         int all_white = 1;
         if (line_sensor_readings.adc_reading[0] > BLACK_BOUNDARY &&
             line_sensor_readings.adc_reading[1] > BLACK_BOUNDARY &&
@@ -199,12 +193,11 @@ void line_follow_task(void *arg)
             break;
         }
 
-        //
         calculate_error();
         calculate_correction();
-        store_sensor_history(); // Record sensor history for sensors 0 and 4
+        store_sensor_history();
 
-        // Update consecutive white count
+        // Update consecutive white count - PROTECTED (only when not turning)
         if (all_white && !left_turn_flag && !right_turn_flag && !u_turn_flag)
         {
             cwhitecount++;
@@ -214,11 +207,43 @@ void line_follow_task(void *arg)
             cwhitecount = 0;
         }
 
-        if (all_white && ir_state == 0)
+        // NEW: IR Obstacle Detection with All-White LSA
+        if (ir_state == 0 && all_white)
         {
-            set_motor_speed(motor_a_0, MOTOR_FORWARD, higher_duty_cycle);
-            set_motor_speed(motor_a_1, MOTOR_BACKWARD, higher_duty_cycle);
-            vTaskDelay(1100 / portTICK_PERIOD_MS);
+            ESP_LOGI("debug", "OBSTACLE DETECTED + ALL WHITE: Reversing and U-turning");
+
+            // Reverse for a short duration
+            set_motor_speed(motor_a_0, MOTOR_BACKWARD, optimum_duty_cycle);
+            set_motor_speed(motor_a_1, MOTOR_BACKWARD, optimum_duty_cycle);
+            vTaskDelay(500 / portTICK_PERIOD_MS); // Reverse for 500ms
+
+            // Perform U-turn using existing logic
+            float leftavg = calculate_average(sensor_0_history);
+            float rightavg = calculate_average(sensor_4_history);
+
+            if (rightavg > 0.1 && leftavg < 0.1)
+            {
+                ESP_LOGI("debug", "OBSTACLE AVOIDANCE: U-turn RIGHT");
+                set_motor_speed(motor_a_0, MOTOR_FORWARD, higher_duty_cycle);
+                set_motor_speed(motor_a_1, MOTOR_BACKWARD, higher_duty_cycle);
+            }
+            else
+            {
+                ESP_LOGI("debug", "OBSTACLE AVOIDANCE: U-turn LEFT");
+                set_motor_speed(motor_a_0, MOTOR_BACKWARD, higher_duty_cycle);
+                set_motor_speed(motor_a_1, MOTOR_FORWARD, higher_duty_cycle);
+            }
+            vTaskDelay(400 / portTICK_PERIOD_MS);
+
+            // Reset sensor averages after U-turn
+            for (int i = 0; i < NOR; i++)
+            {
+                sensor_0_history[i] = 0;
+                sensor_4_history[i] = 0;
+            }
+
+            // Continue to next iteration
+            continue;
         }
 
         float leftavg = calculate_average(sensor_0_history);
@@ -227,6 +252,15 @@ void line_follow_task(void *arg)
         left_duty_cycle = bound((optimum_duty_cycle + correction), lower_duty_cycle, higher_duty_cycle);
         right_duty_cycle = bound((optimum_duty_cycle - correction), lower_duty_cycle, higher_duty_cycle);
 
+        // DEBUG: Log sensor readings and flags
+        ESP_LOGI("debug", "Sensors: [%d, %d, %d, %d, %d] | L:%d R:%d U:%d | IR:%d | error:%.2f",
+                 line_sensor_readings.adc_reading[0],
+                 line_sensor_readings.adc_reading[1],
+                 line_sensor_readings.adc_reading[2],
+                 line_sensor_readings.adc_reading[3],
+                 line_sensor_readings.adc_reading[4],
+                 left_turn_flag, right_turn_flag, u_turn_flag, ir_state, error);
+
         // inverted
         if (line_sensor_readings.adc_reading[0] > BLACK_BOUNDARY &&
             line_sensor_readings.adc_reading[1] > BLACK_BOUNDARY &&
@@ -234,11 +268,19 @@ void line_follow_task(void *arg)
             line_sensor_readings.adc_reading[3] > BLACK_BOUNDARY &&
             line_sensor_readings.adc_reading[4] > BLACK_BOUNDARY)
         {
+            ESP_LOGI("debug", "INVERTED LINE DETECTED");
             set_motor_speed(motor_a_0, MOTOR_FORWARD, left_duty_cycle);
             set_motor_speed(motor_a_1, MOTOR_FORWARD, left_duty_cycle);
         }
 
-        if (left_turn_flag == 1)
+        // Handle all white case - move forward slowly to find line
+        if (all_white && !left_turn_flag && !right_turn_flag && !u_turn_flag)
+        {
+            ESP_LOGI("debug", "ALL WHITE - SEARCHING FOR LINE");
+            set_motor_speed(motor_a_0, MOTOR_FORWARD, optimum_duty_cycle);
+            set_motor_speed(motor_a_1, MOTOR_FORWARD, optimum_duty_cycle);
+        }
+        else if (left_turn_flag == 1)
         {
             set_motor_speed(motor_a_0, MOTOR_BACKWARD, right_duty_cycle);
             set_motor_speed(motor_a_1, MOTOR_FORWARD, right_duty_cycle);
@@ -271,7 +313,6 @@ void line_follow_task(void *arg)
         }
         else if (u_turn_flag)
         {
-
             if (rightavg > 0.1 && leftavg < 0.1)
             {
                 ESP_LOGI("debug", "UUU RIGHT");
@@ -297,13 +338,6 @@ void line_follow_task(void *arg)
             set_motor_speed(motor_a_0, MOTOR_FORWARD, left_duty_cycle);
             set_motor_speed(motor_a_1, MOTOR_FORWARD, right_duty_cycle);
         }
-
-        // if(all_black_flag == 1){
-        //     if(rightavg > 0.05 && leftavg < 0.05){
-        //         set_motor_speed(motor_a_0, MOTOR_FORWARD, left_duty_cycle);
-        //         set_motor_speed(motor_a_1, MOTOR_BACKWARD, right_duty_cycle);
-        //     }
-        // }
 
 #ifdef CONFIG_ENABLE_OLED
         if (read_pid_const().val_changed)
