@@ -9,13 +9,13 @@
 #define WHITE_MARGIN 0
 #define bound_LSA_LOW 0
 #define bound_LSA_HIGH 1000
-#define BLACK_BOUNDARY 830        // Boundary value to distinguish between black and white readings
+#define BLACK_BOUNDARY 905        // Boundary value to distinguish between black and white readings
 #define IR_SENSOR_PIN GPIO_NUM_19 // IR sensor pin
 
-const int weights[5] = {-5, -3, 1, 3, 5};
+const int weights[5] = {-6, -3, 1, 3, 6};
 
 // Motor value bounds
-int optimum_duty_cycle = 60;
+int optimum_duty_cycle = 59;
 int lower_duty_cycle = 46;
 int higher_duty_cycle = 66;
 float left_duty_cycle = 0, right_duty_cycle = 0;
@@ -29,11 +29,11 @@ float error = 0, prev_error = 0, difference = 0, cumulative_error = 0, correctio
 
 int objectflag = 1;
 
-#define REQUIRED_WHITE_COUNT 50
+#define REQUIRED_WHITE_COUNT 20
 int cwhitecount = 0;
 
 // IR sensor debouncing
-#define IR_DEBOUNCE_COUNT 5
+#define IR_DEBOUNCE_COUNT 8
 int ir_obstacle_count = 0;
 // Sensor history tracking for sensors 0 and 4
 int sensor_0_history[NOR] = {0};
@@ -184,15 +184,41 @@ void line_follow_task(void *arg)
             all_white = 0;
         }
 
-        // Stop the bot if consecutive white count exceeds threshold
-        if (cwhitecount >= REQUIRED_WHITE_COUNT)
-        {
-            set_motor_speed(motor_a_0, MOTOR_STOP, 0);
-            set_motor_speed(motor_a_1, MOTOR_STOP, 0);
-            ESP_LOGI("debug", "End of line detected. Stopping bot.");
-            break;
-        }
+        // // Stop the bot if consecutive white count exceeds threshold
+        // if (cwhitecount >= REQUIRED_WHITE_COUNT)
+        // {
+        //     set_motor_speed(motor_a_0, MOTOR_STOP, 0);
+        //     set_motor_speed(motor_a_1, MOTOR_STOP, 0);
+        //     ESP_LOGI("debug", "End of line detected. Stopping bot.");
+        //     break;
+        // }
 
+        // Stop the bot if the line sensors stay all white for at least 1 second
+        static uint32_t all_white_start_time = 0; // persistent timestamp across loop iterations
+
+        if (all_white)
+        {
+            // If this is the first loop where we detect all white, note the time
+            if (all_white_start_time == 0)
+            {
+                all_white_start_time = xTaskGetTickCount();
+            }
+
+            // Check how long it has stayed all white
+            uint32_t elapsed = xTaskGetTickCount() - all_white_start_time;
+            if (elapsed >= pdMS_TO_TICKS(500))
+            {
+                set_motor_speed(motor_a_0, MOTOR_STOP, 0);
+                set_motor_speed(motor_a_1, MOTOR_STOP, 0);
+                ESP_LOGI("debug", "All white for 1 second — stopping bot.");
+                break;
+            }
+        }
+        else
+        {
+            // Reset timer if any black detected again
+            all_white_start_time = 0;
+        }
         calculate_error();
         calculate_correction();
         store_sensor_history();
@@ -215,24 +241,15 @@ void line_follow_task(void *arg)
             // Reverse for a short duration
             set_motor_speed(motor_a_0, MOTOR_BACKWARD, optimum_duty_cycle);
             set_motor_speed(motor_a_1, MOTOR_BACKWARD, optimum_duty_cycle);
-            vTaskDelay(500 / portTICK_PERIOD_MS); // Reverse for 500ms
+            vTaskDelay(700 / portTICK_PERIOD_MS); // Reverse for 700ms
 
             // Perform U-turn using existing logic
             float leftavg = calculate_average(sensor_0_history);
             float rightavg = calculate_average(sensor_4_history);
 
-            if (rightavg > 0.1 && leftavg < 0.1)
-            {
-                ESP_LOGI("debug", "OBSTACLE AVOIDANCE: U-turn RIGHT");
-                set_motor_speed(motor_a_0, MOTOR_FORWARD, higher_duty_cycle);
-                set_motor_speed(motor_a_1, MOTOR_BACKWARD, higher_duty_cycle);
-            }
-            else
-            {
-                ESP_LOGI("debug", "OBSTACLE AVOIDANCE: U-turn LEFT");
-                set_motor_speed(motor_a_0, MOTOR_BACKWARD, higher_duty_cycle);
-                set_motor_speed(motor_a_1, MOTOR_FORWARD, higher_duty_cycle);
-            }
+            ESP_LOGI("debug", "OBSTACLE AVOIDANCE: U-turn LEFT");
+            set_motor_speed(motor_a_0, MOTOR_BACKWARD, higher_duty_cycle);
+            set_motor_speed(motor_a_1, MOTOR_FORWARD, higher_duty_cycle);
             vTaskDelay(400 / portTICK_PERIOD_MS);
 
             // Reset sensor averages after U-turn
@@ -260,18 +277,6 @@ void line_follow_task(void *arg)
                  line_sensor_readings.adc_reading[3],
                  line_sensor_readings.adc_reading[4],
                  left_turn_flag, right_turn_flag, u_turn_flag, ir_state, error);
-
-        // inverted
-        if (line_sensor_readings.adc_reading[0] > BLACK_BOUNDARY &&
-            line_sensor_readings.adc_reading[1] > BLACK_BOUNDARY &&
-            line_sensor_readings.adc_reading[2] < BLACK_BOUNDARY &&
-            line_sensor_readings.adc_reading[3] > BLACK_BOUNDARY &&
-            line_sensor_readings.adc_reading[4] > BLACK_BOUNDARY)
-        {
-            ESP_LOGI("debug", "INVERTED LINE DETECTED");
-            set_motor_speed(motor_a_0, MOTOR_FORWARD, left_duty_cycle);
-            set_motor_speed(motor_a_1, MOTOR_FORWARD, left_duty_cycle);
-        }
 
         // Handle all white case - move forward slowly to find line
         if (all_white && !left_turn_flag && !right_turn_flag && !u_turn_flag)
